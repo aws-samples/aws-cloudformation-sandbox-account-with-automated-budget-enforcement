@@ -1,11 +1,11 @@
-## My Project
+## AWS CloudFormation template for creating a sandbox account with automated budget enforcement
 
 TODO: Fill this README out!
 
-Be sure to:
+This AWS CloudFormation template creates resources in an existing account to create a sandbox account with managed access based on a monthly budget.
 
-* Change the title in this README
-* Edit your repository description on GitHub
+When you deploy this stack it will create:
+A VPC with 2 public subnets, 2 private subnets, vpc flow logs, an internet gateway, a NAT gateway, and a no ingress security group
 
 ## Security
 
