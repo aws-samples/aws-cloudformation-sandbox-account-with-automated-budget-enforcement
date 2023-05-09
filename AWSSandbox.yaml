@@ -1,0 +1,833 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description:  This template makes your newly provisioned AWS account a sandbox account. It creates an AWS Budget with a montly limit and a SandboxDeveloper role. A VPC with 2 public subnets, 2 private subnets, an Internet Gateway, and a NAT Gateway is created to host the 2 Lambda functions. A KMS key is created for encrypting SNS traffic, logs, and Lambda functions. See comments within this template for a full listing of resources created. **WARNING** This template creates a VPC with a NAT Gateway, a KMS Key, Lambda functions, and related resources. You will be billed for the AWS resources used if you create a stack from this template.
+
+Metadata:
+  #Organize how the parameters appear in the AWS console
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Budget settings'
+        Parameters:
+          - Currency
+          - BudgetLimit
+          - StartTime
+          - ThresholdForWarning1
+          - ThresholdForWarning2
+          - ThresholdForLockingSandbox
+      - Label:
+          default: 'IAM roles and policies'
+        Parameters:
+          - KMSAdminRoleName
+          - SandboxRoleName
+          - SandboxRolePolicy
+          - SandboxRoleLockDownPolicy
+          - LambdaRoleName
+      - Label:
+          default: 'Lambda function names'
+        Parameters:
+          - LockdownSandboxFunctionName
+          - RestoreSandboxFunctionName
+      - Label:
+          default: 'SNS topics'
+        Parameters:
+          - SNSBudgetWarningTopicName
+          - SNSBudgetExceededTopicName
+      - Label:
+          default: 'VPC settings'
+        Parameters:
+          - VpcName
+          - VpcCIDR
+          - PublicSubnet1CIDR
+          - PublicSubnet2CIDR
+          - PrivateSubnet1CIDR
+          - PrivateSubnet2CIDR
+          - InternetEgressCIDR
+          - VpcLogGroupName
+
+Parameters:
+  #Budget settings
+  Currency:
+    Description: Currency used for your Budget
+    Type: String
+    Default: USD
+  BudgetLimit:
+    Description: Monthly budget limit
+    Type: Number
+    Default: 100
+  StartTime:
+    Description: The date the budget starts
+    Type: Number
+    Default: 1667275200 #November 1st 2022
+  ThresholdForWarning1:
+    Description: Budget % threshold for first warning notification - value is whole number with no % sign
+    Type: Number
+    Default: 50
+  ThresholdForWarning2:
+    Description: Budget % threshold for second warning notification - value is whole number with no % sign
+    Type: Number
+    Default: 80
+  ThresholdForLockingSandbox:
+    Description: Budget threshold for locking out users and resetting sandbox account
+    Type: Number
+    Default: 100
+
+  #IAM roles and policies
+  KMSAdminRoleName:
+    Description: Name for the KMS administrator role
+    Type: String
+    Default: KMSAdmin
+  SandboxRoleName:
+    Description: Name for the sandbox developer role
+    Type: String
+    Default: SandboxDeveloper
+  SandboxRolePolicy:
+    Description: ARN of the iam policy attached to the sandbox role at creation and when the account is reset each month
+    Type: String
+    Default: arn:aws:iam::aws:policy/PowerUserAccess #Set to PowerUserAccess managed policy by default. This allows users broad access to learn an experiment without full administrator rights. Can be replaced with any other managed or custom policy that better meets your requirements.
+  SandboxRoleLockDownPolicy:
+    Description: ARN of the iam policy attached to the sandbox role after the budget is met and the account is locked down
+    Type: String
+    Default: arn:aws:iam::aws:policy/ReadOnlyAccess #Set to ReadOnlyAccess managed policy by default. This allows users to still access and view the account without creating new resources. Can be replaced with any other managed or custom policy that better meets your requirements. For example, you may want to allow the user to delete resources they have created.
+  LambdaRoleName:
+    Description: Name for the role the Lambda functions assume
+    Type: String
+    Default: SandboxControlLambdaRole
+    
+  #Lambdas
+  LockdownSandboxFunctionName:
+    Description: Name for the Lambda function invoked when the budget is met
+    Type: String
+    Default: LockdownSandbox
+  RestoreSandboxFunctionName:
+    Description: Name for the Lambda function invoked when the sandbox access is restored at the beginning of each month
+    Type: String
+    Default: RestoreSandbox
+
+  #SNS topics
+  SNSBudgetWarningTopicName:
+    Description: Name of SNS topic to create for notifications
+    Type: String
+    Default: SandboxBudgetWarning
+  SNSBudgetExceededTopicName:
+    Description: Name of SNS topic to create for notifications
+    Type: String
+    Default: SandboxBudgetExceeded
+
+  #VPC information
+  VpcName:
+    Description: An VPC environment name that is prefixed to resource names
+    Type: String
+    Default: SandboxVPC
+  VpcCIDR:
+    Description: Please enter the IP range (CIDR notation) for this VPC
+    Type: String
+    Default: 10.192.0.0/20
+  PublicSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+    Type: String
+    Default: 10.192.0.0/24
+  PublicSubnet2CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the second Availability Zone
+    Type: String
+    Default: 10.192.1.0/24
+  PrivateSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the first Availability Zone
+    Type: String
+    Default: 10.192.8.0/24
+  PrivateSubnet2CIDR:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the second Availability Zone
+    Type: String
+    Default: 10.192.9.0/24
+  InternetEgressCIDR:
+    Description: Please enter the IP range (CIDR notation) for the internet egress of your security group
+    Type: String
+    Default: 0.0.0.0/0
+  VpcLogGroupName:
+    Description: The CloudWatch log group name where your VPC Flow Logs will be written
+    Type: String
+    Default: SandboxVPCFlowLogs
+
+Resources:
+  #Create a VPC and subnets for your Lambda functions and other resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref VpcName
+
+  #Public subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs  '' ]
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${VpcName} Public Subnet (AZ1)
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs  '' ]
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${VpcName} Public Subnet (AZ2)
+
+  #Private subnets
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs  '' ]
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${VpcName} Private Subnet (AZ1)
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${VpcName} Private Subnet (AZ2)
+
+  #Internet gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VPCInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: !Ref InternetEgressCIDR
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  #NAT gateway
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+      - Key: Name
+        Value: !Sub ${VpcName} NAT Gateway (AZ1)
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPC
+    Properties:
+      Domain: vpc
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+        VpcId: !Ref VPC
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      NatGatewayId: !Ref NATGateway
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: !Ref InternetEgressCIDR
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  #Security group
+  NoIngressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: 'no-ingress-sg'
+      GroupDescription: 'Security group with egress only'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          Description: Egress only HTTP
+          CidrIp: !Ref InternetEgressCIDR
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          Description: Egress only HTTPS
+          CidrIp: !Ref InternetEgressCIDR
+      VpcId: !Ref VPC
+
+  #VPC flow logs
+  VPCFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: vpc-flow-logs.amazonaws.com
+          Action: 'sts:AssumeRole'
+  VPCLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub ${VpcLogGroupName}
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt KMSKey.Arn
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+        DeliverLogsPermissionArn: !GetAtt VPCFlowLogRole.Arn
+        ResourceId: !Ref VPC
+        ResourceType: VPC
+        LogDestination: !GetAtt VPCLogGroup.Arn
+        TrafficType: ALL
+  VPCFlowLogPermissions:
+    Type: AWS::IAM::Policy
+    Properties:
+        Roles:
+          - !Ref VPCFlowLogRole
+        PolicyName: VPCFlowLogToCW
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+                - 'logs:DescribeLogGroups'
+                - 'logs:DescribeLogStreams'
+              Resource: !GetAtt VPCLogGroup.Arn
+
+ #Create a KMS primary key for encrypting your Lambda functions, SNS topics, and other resources
+ 
+  KMSAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action:
+              - 'sts:AssumeRole'
+      RoleName: !Sub ${KMSAdminRoleName}
+  
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+        Description: A multi-Region primary key
+        MultiRegion: true
+        EnableKeyRotation: true
+        PendingWindowInDays: 10
+        KeyPolicy:
+            Version: 2012-10-17
+            Id: sandbox-primary-key
+            Statement:
+                - Sid: EnableIAMRolePermissions
+                  Effect: Allow
+                  Principal:
+                    AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+                  Action: 'kms:*'
+                  Resource: '*'
+                - Sid: Allow administration of the key
+                  Effect: Allow
+                  Principal:
+                    AWS: !GetAtt KMSAdminRole.Arn
+                  Action:
+                   - 'kms:ReplicateKey'
+                   - 'kms:Create*'
+                   - 'kms:Describe*'
+                   - 'kms:Enable*'
+                   - 'kms:List*'
+                   - 'kms:Put*'
+                   - 'kms:Update*'
+                   - 'kms:Revoke*'
+                   - 'kms:Disable*'
+                   - 'kms:Get*'
+                   - 'kms:Delete*'
+                   - 'kms:ScheduleKeyDeletion'
+                   - 'kms:CancelKeyDeletion'
+                  Resource: '*'
+                - Sid: AllowLockdownSandboxLambdaFunction
+                  Effect: Allow
+                  Principal:
+                    Service:
+                    - 'lambda.amazonaws.com'
+                  Action:
+                    - 'kms:DescribeKey'
+                    - 'kms:Encrypt'
+                    - 'kms:Decrypt'
+                    - 'kms:ReEncrypt*'
+                    - 'kms:GenerateDataKey'
+                    - 'kms:GenerateDataKeyWithoutPlaintext'
+                  Resource: '*' #Within the key policy attached to the key at creation, * means this key to which the policy is being attached
+                  Condition:
+                    StringEquals:
+                        'aws:SourceArn': !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LockdownSandboxFunctionName}'
+                - Sid: Allow use of the key by the RestoreSandbox Lambda function
+                  Effect: Allow
+                  Principal:
+                    Service:
+                    - 'lambda.amazonaws.com'
+                  Action:
+                    - 'kms:DescribeKey'
+                    - 'kms:Encrypt'
+                    - 'kms:Decrypt'
+                    - 'kms:ReEncrypt*'
+                    - 'kms:GenerateDataKey'
+                    - 'kms:GenerateDataKeyWithoutPlaintext'
+                  Resource: '*' #Within the key policy attached to the key at creation, * means this key to which the policy is being attached
+                  Condition:
+                    StringEquals:
+                        'aws:SourceArn': !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${RestoreSandboxFunctionName}'
+                - Sid: AllowLockdownSandboxLogGroup
+                  Effect: Allow
+                  Principal:
+                    Service:
+                    - 'logs.amazonaws.com'
+                  Action:
+                    - 'kms:DescribeKey'
+                    - 'kms:Encrypt'
+                    - 'kms:Decrypt'
+                    - 'kms:ReEncrypt*'
+                    - 'kms:GenerateDataKey'
+                    - 'kms:GenerateDataKeyWithoutPlaintext'
+                  Resource: '*' #Within the key policy attached to the key at creation, * means this key to which the policy is being attached
+                  Condition:
+                    StringEquals:
+                        'aws:SourceArn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LockdownSandboxFunctionName}'
+                - Sid: AllowRestoreSandboxLogGroup
+                  Effect: Allow
+                  Principal:
+                    Service:
+                    - 'logs.amazonaws.com'
+                  Action:
+                    - 'kms:DescribeKey'
+                    - 'kms:Encrypt'
+                    - 'kms:Decrypt'
+                    - 'kms:ReEncrypt*'
+                    - 'kms:GenerateDataKey'
+                    - 'kms:GenerateDataKeyWithoutPlaintext'
+                  Resource: '*' #Within the key policy attached to the key at creation, * means this key to which the policy is being attached
+                  Condition:
+                    StringEquals:
+                        'aws:SourceArn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${RestoreSandboxFunctionName}'
+                - Sid: AllowVPCFlowLog
+                  Effect: Allow
+                  Principal:
+                    Service:
+                    - 'logs.amazonaws.com'
+                  Action:
+                    - 'kms:DescribeKey'
+                    - 'kms:Encrypt'
+                    - 'kms:Decrypt'
+                    - 'kms:ReEncrypt*'
+                    - 'kms:GenerateDataKey'
+                    - 'kms:GenerateDataKeyWithoutPlaintext'
+                  Resource: '*' #Within the key policy attached to the key at creation, * means this key to which the policy is being attached
+                  Condition:
+                    StringEquals:
+                        'aws:SourceArn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${VpcLogGroupName}'
+                - Sid: AllowBudgetWarningSNS
+                  Effect: Allow
+                  Principal:
+                    Service:
+                    - 'sns.amazonaws.com'
+                  Action:
+                    - 'kms:DescribeKey'
+                    - 'kms:Encrypt'
+                    - 'kms:Decrypt'
+                    - 'kms:ReEncrypt*'
+                    - 'kms:GenerateDataKey'
+                    - 'kms:GenerateDataKeyWithoutPlaintext'
+                  Resource: '*' #Within the key policy attached to the key at creation, * means this key to which the policy is being attached
+                  Condition:
+                    StringEquals:
+                        'aws:SourceArn': !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${SNSBudgetWarningTopicName}'
+                - Sid: AllowBudgetExceededSNS
+                  Effect: Allow
+                  Principal:
+                    Service:
+                    - 'sns.amazonaws.com'
+                  Action:
+                    - 'kms:DescribeKey'
+                    - 'kms:Encrypt'
+                    - 'kms:Decrypt'
+                    - 'kms:ReEncrypt*'
+                    - 'kms:GenerateDataKey'
+                    - 'kms:GenerateDataKeyWithoutPlaintext'
+                  Resource: '*' #Within the key policy attached to the key at creation, * means this key to which the policy is being attached
+                  Condition:
+                    StringEquals:
+                        'aws:SourceArn' : !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${SNSBudgetExceededTopicName}'
+                - Sid: AllowAWSBudgets
+                  Effect: Allow
+                  Principal:
+                    Service:
+                    - 'budgets.amazonaws.com'
+                  Action:
+                    - 'kms:Decrypt'
+                    - 'kms:GenerateDataKey*'
+                  Resource: '*' #Within the key policy attached to the key at creation, * means this key to which the policy is being attached
+                  Condition:
+                    StringEquals:
+                        'aws:SourceAccount' : !Sub ${AWS::AccountId}
+                    ArnLike:
+                        'aws:SourceArn': !Sub 'arn:${AWS::Partition}:budgets::${AWS::AccountId}:*'
+
+#Create the SandboxDeveloperRole for users to assume
+  SandboxDeveloperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action:
+              - 'sts:AssumeRole'
+      RoleName: !Sub ${SandboxRoleName}
+      ManagedPolicyArns:
+        - !Sub ${SandboxRolePolicy}
+
+  #create SNS topic for budget warning notification
+  SNSBudgetWarning:
+    Type: AWS::SNS::Topic
+    Properties:
+     TopicName: !Sub ${SNSBudgetWarningTopicName}
+     DisplayName: !Sub ${SNSBudgetWarningTopicName}
+     KmsMasterKeyId: !Ref KMSKey
+
+  #create SNS topic policy for budget warning notification
+  SNSBudgetWarningPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: !Sub ${SNSBudgetWarningTopicName}Policy
+        Version: "2012-10-17"
+        Statement:
+          - Sid: !Sub ${SNSBudgetWarningTopicName}BudgetsNotification
+            Effect: Allow
+            Principal:
+              Service: 'budgets.amazonaws.com'
+            Action: 'SNS:Publish'
+            Resource: !Ref SNSBudgetWarning
+            Condition:
+                StringEquals: 
+                    'aws:SourceAccount': !Sub ${AWS::AccountId}
+                ArnLike:
+                    'aws:SourceArn': !Sub 'arn:${AWS::Partition}:budgets::${AWS::AccountId}:*'
+      Topics:
+        - !Ref SNSBudgetWarning
+
+  #create SNS topic for budget exceeded notification that will trigger the account lockdown
+  SNSBudgetExceeded:
+    Type: AWS::SNS::Topic
+    Properties:
+     TopicName: !Sub ${SNSBudgetExceededTopicName}
+     DisplayName: !Sub ${SNSBudgetExceededTopicName}
+     KmsMasterKeyId: !Ref KMSKey
+     Subscription:
+      - Endpoint:
+          !GetAtt LockdownSandboxLambda.Arn
+        Protocol: lambda
+
+  #policy for the budget exceeded SNS topic
+  SNSBudgetExceededPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: !Sub ${SNSBudgetExceededTopicName}Policy
+        Version: "2012-10-17"
+        Statement:
+          - Sid: !Sub ${SNSBudgetExceededTopicName}BudgetsNotification
+            Effect: Allow
+            Principal:
+              Service: 'budgets.amazonaws.com'
+            Action: 'SNS:Publish'
+            Resource: !Ref SNSBudgetExceeded
+            Condition:
+                StringEquals: 
+                    'aws:SourceAccount': !Sub ${AWS::AccountId}
+                ArnLike:
+                    'aws:SourceArn': !Sub 'arn:${AWS::Partition}:budgets::${AWS::AccountId}:*'
+      Topics:
+        - !Ref SNSBudgetExceeded
+
+  #create the budget in AWS budgets with you desired monthly limit and alerting thresholds
+  SandboxBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetLimit:
+          Amount: !Sub ${BudgetLimit}
+          Unit: !Sub ${Currency}
+        TimeUnit: MONTHLY
+        TimePeriod:
+          Start: !Sub ${StartTime}
+        BudgetType: COST
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Sub ${ThresholdForWarning1}
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref SNSBudgetWarning
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Sub ${ThresholdForWarning2}
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref SNSBudgetWarning
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Sub ${ThresholdForLockingSandbox}
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref SNSBudgetExceeded
+    DependsOn:
+      - SNSBudgetWarningPolicy
+      - SNSBudgetExceededPolicy
+
+  #Create log groups for the Lambda functions
+  LockdownSandboxLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+        LogGroupName: !Sub '/aws/lambda/${LockdownSandboxFunctionName}'
+        RetentionInDays: 7
+        KmsKeyId: !GetAtt KMSKey.Arn
+   
+  RestoreSandboxLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+        LogGroupName: !Sub '/aws/lambda/${RestoreSandboxFunctionName}'
+        RetentionInDays: 7
+        KmsKeyId: !GetAtt KMSKey.Arn
+
+  #Create role for the sandbox lambdas to run as
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      RoleName: !Sub ${LambdaRoleName}
+      Policies:
+        - PolicyName: LambdaRolePolicyMgmt
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iam:DetachRolePolicy'
+                  - 'iam:AttachRolePolicy'
+                Resource: !GetAtt SandboxDeveloperRole.Arn
+              - Effect: Allow
+                Action:
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:DeleteNetworkInterface'
+                Resource: '*'
+        - PolicyName: SandboxLambdaLogging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource:
+                  - !GetAtt LockdownSandboxLogGroup.Arn
+                  - !GetAtt RestoreSandboxLogGroup.Arn
+
+  #Create the lambda that runs when the budget is exceeded
+  LockdownSandboxLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LockdownSandboxFunctionName
+      Runtime: python3.9
+      Role: !GetAtt LambdaRole.Arn
+      Handler: index.lambda_handler
+      KmsKeyArn: !GetAtt KMSKey.Arn
+      VpcConfig:
+        SecurityGroupIds:
+            - !Sub ${NoIngressSecurityGroup}
+        SubnetIds:
+            - !Sub ${PrivateSubnet1}
+            - !Sub ${PrivateSubnet2}
+      ReservedConcurrentExecutions: 1
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+
+                #Create IAM client
+                iam = boto3.client('iam')
+                
+                #Detach default Sandbox role policy from SandboxDeveloper role
+                iam.detach_role_policy(
+                PolicyArn='${SandboxRolePolicy}',
+                RoleName='SandboxDeveloper'
+                )
+
+                #Attach Sandbox role lockdown policy to SandboxDeveloper role
+                iam.attach_role_policy(
+                PolicyArn='${SandboxRoleLockDownPolicy}',
+                RoleName='SandboxDeveloper'
+                )
+                
+                #Return success message, if there is an error that will be automatically returned
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps('SandboxDeveloper role set to read only')
+                }
+
+  #Give the SNS topic permissions to invoke the lambda
+  PermissionToInvokeLockdownLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LockdownSandboxLambda
+      Action: 'lambda:InvokeFunction'
+      Principal: 'sns.amazonaws.com'
+      SourceArn: !Ref SNSBudgetExceeded
+
+  #Create lambda to restore sandbox access
+  RestoreSandboxLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref RestoreSandboxFunctionName
+      Runtime: python3.9
+      Role: !GetAtt LambdaRole.Arn
+      Handler: index.lambda_handler
+      KmsKeyArn: !GetAtt KMSKey.Arn
+      VpcConfig:
+        SecurityGroupIds:
+            - !Sub ${NoIngressSecurityGroup}
+        SubnetIds:
+            - !Sub ${PrivateSubnet1}
+            - !Sub ${PrivateSubnet2}
+      ReservedConcurrentExecutions: 1
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+
+                #Create IAM client
+                iam = boto3.client('iam')
+                
+                #Detach the Sandbox role lockdown policy from SandboxDeveloper role
+                iam.detach_role_policy(
+                PolicyArn='${SandboxRoleLockDownPolicy}',
+                RoleName='SandboxDeveloper'
+                )
+
+                #Attach default Sandbox role policy to SandboxDeveloper role
+                iam.attach_role_policy(
+                PolicyArn='${SandboxRolePolicy}',
+                RoleName='SandboxDeveloper'
+                )
+                
+                #Return success message, if there is an error that will be automatically returned
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps('SandboxDeveloper role access restored')
+                }
+
+
+  #Creae schedule to restore sandbox access
+  ScheduleToRestoreAccess:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Rule in EventBridge to invoke the RestoreSandbox Lambda function at the beginning of each month
+      ScheduleExpression: cron(0 5 1 * ? *) #This is set for 5 UTC which is 12:00AM EST, during DST it will run at 1:00AM
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RestoreSandboxLambda.Arn
+          Id: RestoreSandboxLambda
+
+  #Permission for schedule to invoke lambda
+  PermissionForEventToInvokeRestoreLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RestoreSandboxLambda
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn:
+        !GetAtt ScheduleToRestoreAccess.Arn
+
+Outputs:
+  BudgetId:
+    Description: The monthly budget for your account created in AWS Budgets
+    Value: !Ref SandboxBudget
+  LockdownSandboxLambdaFunction:
+    Description: ARN for the LockdownSandbox function
+    Value: !GetAtt LockdownSandboxLambda.Arn
+  RestoreSandboxLambdaFunction:
+    Description: ARN for the RestoreSandbox function
+    Value: !GetAtt RestoreSandboxLambda.Arn
+  BudgetWarningSNSTopic:
+    Description: ARN for the Budget Warning SNS topic
+    Value: !Ref SNSBudgetWarning
+  BudgetExceededSNSTopic:
+    Description: ARN for the Budget Exceeded SNS topic
+    Value: !Ref SNSBudgetExceeded
+  SandboxVPC:
+    Description: A reference to the created VPC
+    Value: !Ref VPC
+  PublicSubnets:
+    Description: A list of the public subnets
+    Value: !Join [ ",", [ !Ref PublicSubnet1, !Ref PublicSubnet2 ]]
+  PrivateSubnets:
+    Description: A list of the private subnets
+    Value: !Join [ ",", [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]]
