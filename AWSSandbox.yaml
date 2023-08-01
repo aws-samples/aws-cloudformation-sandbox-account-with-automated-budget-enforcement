@@ -87,7 +87,7 @@ Parameters:
     
   #Lambdas
   LockdownSandboxFunctionName:
-    Description: Name for the Lambda function invoked when the budget is met
+    Description: Name for the Lambda function invoked when the monthly budget is met
     Type: String
     Default: LockdownSandbox
   RestoreSandboxFunctionName:
