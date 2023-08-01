@@ -21,8 +21,6 @@ Metadata:
         Parameters:
           - KMSAdminRoleName
           - SandboxRoleName
-          - SandboxRolePolicy
-          - SandboxRoleLockDownPolicy
           - LambdaRoleName
       - Label:
           default: 'Lambda function names'
@@ -82,14 +80,6 @@ Parameters:
     Description: Name for the sandbox developer role
     Type: String
     Default: SandboxDeveloper
-  SandboxRolePolicy:
-    Description: ARN of the iam policy attached to the sandbox role at creation and when the account is reset each month
-    Type: String
-    Default: arn:aws:iam::aws:policy/PowerUserAccess #Set to PowerUserAccess managed policy by default. This allows users broad access to learn an experiment without full administrator rights. Can be replaced with any other managed or custom policy that better meets your requirements.
-  SandboxRoleLockDownPolicy:
-    Description: ARN of the iam policy attached to the sandbox role after the budget is met and the account is locked down
-    Type: String
-    Default: arn:aws:iam::aws:policy/ReadOnlyAccess #Set to ReadOnlyAccess managed policy by default. This allows users to still access and view the account without creating new resources. Can be replaced with any other managed or custom policy that better meets your requirements. For example, you may want to allow the user to delete resources they have created.
   LambdaRoleName:
     Description: Name for the role the Lambda functions assume
     Type: String
@@ -508,7 +498,7 @@ Resources:
                         'aws:SourceAccount' : !Sub ${AWS::AccountId}
                     ArnLike:
                         'aws:SourceArn': !Sub 'arn:${AWS::Partition}:budgets::${AWS::AccountId}:*'
-
+              
 #Create the SandboxDeveloperRole for users to assume
   SandboxDeveloperRole:
     Type: AWS::IAM::Role
@@ -523,8 +513,35 @@ Resources:
             Action:
               - 'sts:AssumeRole'
       RoleName: !Sub ${SandboxRoleName}
-      ManagedPolicyArns:
-        - !Sub ${SandboxRolePolicy}
+      ManagedPolicyArns:  #Start at providing PowerUserAccess
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/PowerUserAccess
+        
+#Create SandboxPowerUserRestrictions IAM policy
+  SandboxPowerUserRestrictionsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub SandboxPowerUserRestrictions-${AWS::Region} #Add Region to policy name to avoid issues when deploying stack to multiple AWS Regions
+      PolicyDocument:  #Remove permissions from PowerUserAccess that you do not want, including the ability to modify Budgets and the Lambda functions that govern SandboxDeveloper access
+        Version: "2012-10-17"
+        Statement:
+            - Sid: RestrictBudgetsAccess
+              Effect: Deny
+              Action:
+                - 'budgets:CreateBudgetAction'
+                - 'budgets:DeleteBudgetAction'
+                - 'budgets:ExecuteBudgetAction'
+                - 'budgets:ModifyBudget'
+                - 'budgets:UpdateBudgetAction'
+              Resource: '*'
+            - Sid: RestrictAccessToSandboxLambdas
+              Effect: Deny
+              Action:
+                - 'lambda:*'
+              Resource: 
+                - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LockdownSandboxFunctionName}'
+                - !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${RestoreSandboxFunctionName}'
+      Roles:
+        - !Ref SandboxDeveloperRole
 
   #create SNS topic for budget warning notification
   SNSBudgetWarning:
@@ -713,15 +730,21 @@ Resources:
                 #Create IAM client
                 iam = boto3.client('iam')
                 
-                #Detach default Sandbox role policy from SandboxDeveloper role
+                #Detach PowerUserAccess policy from SandboxDeveloper role
                 iam.detach_role_policy(
-                PolicyArn='${SandboxRolePolicy}',
+                PolicyArn='arn:${AWS::Partition}:iam::aws:policy/PowerUserAccess',
+                RoleName='SandboxDeveloper'
+                )
+                
+                #Detach SandboxPowerUserRestrictions policy from SandboxDeveloper role
+                iam.detach_role_policy(
+                PolicyArn='arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/SandboxPowerUserRestrictions-${AWS::Region}',
                 RoleName='SandboxDeveloper'
                 )
 
-                #Attach Sandbox role lockdown policy to SandboxDeveloper role
+                #Attach ReadOnlyAccess SandboxDeveloper role
                 iam.attach_role_policy(
-                PolicyArn='${SandboxRoleLockDownPolicy}',
+                PolicyArn='arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess',
                 RoleName='SandboxDeveloper'
                 )
                 
@@ -768,13 +791,19 @@ Resources:
                 
                 #Detach the Sandbox role lockdown policy from SandboxDeveloper role
                 iam.detach_role_policy(
-                PolicyArn='${SandboxRoleLockDownPolicy}',
+                PolicyArn='arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess',
                 RoleName='SandboxDeveloper'
                 )
 
-                #Attach default Sandbox role policy to SandboxDeveloper role
+                #Attach PowerUserAccess policy to SandboxDeveloper role
                 iam.attach_role_policy(
-                PolicyArn='${SandboxRolePolicy}',
+                PolicyArn='arn:${AWS::Partition}:iam::aws:policy/PowerUserAccess',
+                RoleName='SandboxDeveloper'
+                )
+                
+                #Attach SandboxPowerUserRestrictions policy to SandboxDeveloper role
+                iam.attach_role_policy(
+                PolicyArn='arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/SandboxPowerUserRestrictions-${AWS::Region}',
                 RoleName='SandboxDeveloper'
                 )
                 
