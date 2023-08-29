@@ -719,7 +719,6 @@ Resources:
         SubnetIds:
             - !Sub ${PrivateSubnet1}
             - !Sub ${PrivateSubnet2}
-      ReservedConcurrentExecutions: 1
       Code:
         ZipFile: !Sub |
           import json
@@ -778,7 +777,6 @@ Resources:
         SubnetIds:
             - !Sub ${PrivateSubnet1}
             - !Sub ${PrivateSubnet2}
-      ReservedConcurrentExecutions: 1
       Code:
         ZipFile: !Sub |
           import json
